@@ -1,0 +1,356 @@
+# CI/CD Pipeline for Cats vs Dogs Classification
+# Builds, tests, and deploys the ML model service
+
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+  packages: write
+  security-events: write
+
+env:
+  REGISTRY: docker.io
+  IMAGE_NAME: releaseboat/mlops-cats-dogs-project
+  IMAGE_REF: releaseboat/mlops-cats-dogs-project:${{ github.sha }}
+
+jobs:
+  # ============================================
+  # JOB 1: Lint and Test
+  # ============================================
+  test:
+    name: Run Tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install flake8 black isort
+
+      - name: Lint with flake8
+        run: |
+          flake8 src/ tests/ --count --select=E9,F63,F7,F82 --show-source --statistics
+          flake8 src/ tests/ --count --exit-zero --max-complexity=10 --max-line-length=100 --statistics
+
+      - name: Run unit tests
+        run: |
+          pytest tests/ -v --cov=src --cov-report=xml --cov-report=html
+
+      - name: Upload coverage reports
+        uses: codecov/codecov-action@v3
+        with:
+          file: ./coverage.xml
+          fail_ci_if_error: false
+
+  # ============================================
+  # JOB 2: Build Docker Image
+  # ============================================
+  build:
+    name: Build Docker Image
+    runs-on: ubuntu-latest
+    needs: test
+
+    outputs:
+      image_ref: ${{ steps.refs.outputs.image_ref }}
+      image_digest: ${{ steps.build.outputs.digest }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: releaseboat
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=sha,prefix=
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Create dummy model for build
+        run: |
+          mkdir -p models
+          touch models/model.pt
+
+      - name: Set image reference output
+        id: refs
+        run: echo "image_ref=${{ env.IMAGE_REF }}" >> $GITHUB_OUTPUT
+
+      - name: Build and push Docker image
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: |
+            ${{ steps.meta.outputs.tags }}
+            ${{ env.IMAGE_REF }}
+          labels: ${{ steps.meta.outputs.labels }}
+          platforms: linux/amd64
+          provenance: false
+          sbom: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Save image publication evidence
+        run: |
+          mkdir -p artifacts
+          {
+            echo "registry=${{ env.REGISTRY }}"
+            echo "image=${{ env.IMAGE_NAME }}"
+            echo "image_ref=${{ env.IMAGE_REF }}"
+            echo "digest=${{ steps.build.outputs.digest }}"
+          } | tee artifacts/image_publish_evidence.txt
+
+      - name: Upload image publication evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: image-publication-evidence
+          path: artifacts/image_publish_evidence.txt
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.IMAGE_NAME }}:${{ github.sha }}
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+        continue-on-error: true
+
+  # ============================================
+  # JOB 3: Integration Tests
+  # ============================================
+  integration-test:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.event_name != 'pull_request'
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Login to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: Releaseboat0907
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Create dummy model
+        run: |
+          mkdir -p models
+          touch models/model.pt
+
+      - name: Start services with Docker Compose
+        run: |
+          docker compose up -d cats-dogs-api
+
+      - name: Health check
+        run: |
+          for i in {1..24}; do
+            if curl -fsS http://localhost:8000/health; then
+              echo "API health check passed"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "API failed to become healthy within 120 seconds"
+          docker compose ps
+          docker logs cats-dogs-classifier --tail 200 || true
+          exit 1
+
+      - name: Run smoke tests
+        run: |
+          # Test health endpoint
+          curl -f http://localhost:8000/health
+          
+          # Test base64 prediction endpoint without extra runner dependencies
+          TEST_PNG_B64="iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO7Zx6QAAAAASUVORK5CYII="
+          HTTP_CODE=$(curl -sS -o /tmp/predict_response.json -w "%{http_code}" \
+            -X POST "http://localhost:8000/predict/base64" \
+            -H "Content-Type: application/json" \
+            -d "{\"image_base64\":\"${TEST_PNG_B64}\"}")
+          cat /tmp/predict_response.json
+          test "$HTTP_CODE" = "200"
+          echo "Smoke tests passed!"
+
+      - name: Stop services
+        if: always()
+        run: docker compose down
+
+  # ============================================
+  # JOB 4: Deploy to Staging
+  # ============================================
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    needs: [build, integration-test]
+    if: github.ref == 'refs/heads/develop'
+    environment: staging
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Login to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: Releaseboat0907
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Deploy to staging
+        run: |
+          echo "Deploying staging image: ${{ needs.build.outputs.image_ref }}"
+          docker pull ${{ needs.build.outputs.image_ref }}
+          export IMAGE_REF=${{ needs.build.outputs.image_ref }}
+          docker compose -f docker-compose.prod.yml up -d
+
+      - name: Staging smoke tests
+        run: |
+          for i in {1..24}; do
+            if curl -fsS http://localhost:8000/health; then
+              break
+            fi
+            sleep 5
+          done
+          curl -fsS http://localhost:8000/health || (docker compose -f docker-compose.prod.yml ps && docker logs cats-dogs-classifier --tail 200 && exit 1)
+          TEST_PNG_B64="iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO7Zx6QAAAAASUVORK5CYII="
+          HTTP_CODE=$(curl -sS -o /tmp/staging_predict_response.json -w "%{http_code}" \
+            -X POST "http://localhost:8000/predict/base64" \
+            -H "Content-Type: application/json" \
+            -d "{\"image_base64\":\"${TEST_PNG_B64}\"}")
+          cat /tmp/staging_predict_response.json
+          test "$HTTP_CODE" = "200"
+
+      - name: Stop staging services
+        if: always()
+        run: docker compose -f docker-compose.prod.yml down
+
+  # ============================================
+  # JOB 5: Deploy to Production
+  # ============================================
+  deploy-production:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: [build, integration-test]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    environment: production
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Login to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: releaseboat
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Pull and deploy production image
+        run: |
+          echo "Deploying to production with image: ${{ needs.build.outputs.image_ref }}"
+          docker pull ${{ needs.build.outputs.image_ref }}
+          mkdir -p logs
+          export IMAGE_REF=${{ needs.build.outputs.image_ref }}
+          docker compose -f docker-compose.prod.yml up -d
+
+      - name: Wait for service health
+        run: |
+          for i in {1..20}; do
+            if curl -fsS http://localhost:8000/health; then
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "Service failed health warm-up"
+          exit 1
+
+      - name: Run post-deployment smoke tests
+        run: |
+          curl -f http://localhost:8000/health
+          TEST_PNG_B64="iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO7Zx6QAAAAASUVORK5CYII="
+          HTTP_CODE=$(curl -sS -o /tmp/prod_predict_response.json -w "%{http_code}" \
+            -X POST "http://localhost:8000/predict/base64" \
+            -H "Content-Type: application/json" \
+            -d "{\"image_base64\":\"${TEST_PNG_B64}\"}")
+          cat /tmp/prod_predict_response.json
+          test "$HTTP_CODE" = "200"
+
+      - name: Run post-deployment performance tracking
+        run: |
+          mkdir -p logs/monitoring
+          TEST_PNG_B64="iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO7Zx6QAAAAASUVORK5CYII="
+          total=50
+          ok=0
+          fail=0
+          : > logs/monitoring/perf_results.csv
+          echo "request,latency_ms,status" > logs/monitoring/perf_results.csv
+          for i in $(seq 1 $total); do
+            start=$(date +%s%3N)
+            code=$(curl -sS -o /tmp/perf_resp.json -w "%{http_code}" \
+              -X POST "http://localhost:8000/predict/base64" \
+              -H "Content-Type: application/json" \
+              -d "{\"image_base64\":\"${TEST_PNG_B64}\"}" || echo "000")
+            end=$(date +%s%3N)
+            latency=$((end-start))
+            echo "$i,$latency,$code" >> logs/monitoring/perf_results.csv
+            if [ "$code" = "200" ]; then ok=$((ok+1)); else fail=$((fail+1)); fi
+          done
+          {
+            echo "total_requests=$total"
+            echo "successful_requests=$ok"
+            echo "failed_requests=$fail"
+          } | tee logs/monitoring/summary.txt
+          test "$ok" -ge 45
+
+      - name: Upload deployment monitoring evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: production-monitoring-evidence
+          path: logs/monitoring
+
+      - name: Notify on success
+        if: success()
+        run: |
+          echo "Deployment successful!"
+
+      - name: Rollback on failure
+        if: failure()
+        run: |
+          echo "Deployment failed. Rolling back local deployment..."
+          docker compose -f docker-compose.prod.yml down
+
+      - name: Cleanup deployment
+        if: always()
+        run: docker compose -f docker-compose.prod.yml down
