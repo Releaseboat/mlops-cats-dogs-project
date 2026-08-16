@@ -35,7 +35,7 @@ python scripts\prepare_data.py
 
 REM 6. Train initial model
 echo Training initial model...
-python src\models\train.py --epochs 5 --data-dir data\processed --output-dir models
+python src/models/train.py --epochs 5 --data-dir data\processed --output-dir models
 
 echo ==========================================
 echo Project initialized successfully!
